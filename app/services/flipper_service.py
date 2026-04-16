@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Iterable, List
 
 from aiogram import Bot
 from playwright.async_api import async_playwright
@@ -45,16 +44,39 @@ class FlipperService:
 
         async with self._lock:
             logger.info("=== START SCAN ===")
+
             offers = await self._collect_offers()
             logger.info("Zebrano ofert: %s", len(offers))
+
+            for offer in offers[:20]:
+                logger.info(
+                    "RAW | source=%s | model=%s | price=%s | title=%s | image_url=%s",
+                    offer.source,
+                    offer.model,
+                    offer.price,
+                    offer.title,
+                    offer.image_url,
+                )
 
             filtered = self._filter_and_score(offers)
             logger.info("Po filtrach zostało: %s", len(filtered))
 
+            for offer in filtered[:20]:
+                logger.info(
+                    "FILTERED | source=%s | model=%s | price=%s | score=%s | title=%s",
+                    offer.source,
+                    offer.model,
+                    offer.price,
+                    offer.score,
+                    offer.title,
+                )
+
             published = 0
             for offer in filtered:
                 if await self.db.has_seen(offer):
+                    logger.info("Pomijam seen offer: %s", offer.url)
                     continue
+
                 try:
                     await self.publish_offer(offer)
                     await self.db.mark_seen(offer)
@@ -71,6 +93,7 @@ class FlipperService:
             return []
 
         all_offers: list[Offer] = []
+
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=self.settings.HEADLESS,
@@ -80,21 +103,26 @@ class FlipperService:
                     "--disable-dev-shm-usage",
                 ],
             )
+
             try:
                 tasks = [scraper.scrape(browser) for scraper in scrapers]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+
                 for result in results:
                     if isinstance(result, Exception):
                         logger.exception("Scraper zwrócił wyjątek", exc_info=result)
                         continue
                     all_offers.extend(result)
+
             finally:
                 await browser.close()
 
+        # deduplikacja po URL
         unique_by_url: dict[str, Offer] = {}
         for offer in all_offers:
             if offer.url and offer.url not in unique_by_url:
                 unique_by_url[offer.url] = offer
+
         return list(unique_by_url.values())
 
     def _filter_and_score(self, offers: list[Offer]) -> list[Offer]:
@@ -106,7 +134,7 @@ class FlipperService:
 
             offer.score = calculate_offer_score(offer, self.settings.reference_prices)
 
-            # Bonus za preferowaną lokalizację
+            # mały bonus za preferowaną lokalizację
             if is_location_preferred(offer.location, self.settings):
                 offer.score += 0.02
 
@@ -128,21 +156,36 @@ class FlipperService:
         caption = build_offer_caption(offer, self.settings)
         keyboard = build_offer_keyboard(offer)
 
-        logger.info("Publikuję ofertę: %s | %s | %.2f", offer.source, offer.model, offer.price)
+        logger.info(
+            "Publikuję ofertę: %s | %s | %.2f",
+            offer.source,
+            offer.model,
+            offer.price,
+        )
 
-        if offer.image_url:
+        image_url = (offer.image_url or "").strip()
+
+        # zdjęcie wysyłamy tylko wtedy, gdy wygląda jak poprawny pełny URL
+        if image_url.startswith("http://") or image_url.startswith("https://"):
             try:
                 await self.bot.send_photo(
                     chat_id=self.settings.CHANNEL_ID,
-                    photo=offer.image_url,
+                    photo=image_url,
                     caption=caption,
                     parse_mode="HTML",
                     reply_markup=keyboard,
                 )
+                logger.info("Wysłano przez send_photo: %s", offer.url)
                 return
-            except Exception:
-                logger.exception("send_photo nieudane, fallback do send_message: %s", offer.url)
+            except Exception as e:
+                logger.exception(
+                    "Błąd send_photo dla %s | image_url=%s | error=%s",
+                    offer.url,
+                    image_url,
+                    e,
+                )
 
+        # fallback bez zdjęcia
         await self.bot.send_message(
             chat_id=self.settings.CHANNEL_ID,
             text=caption,
@@ -150,3 +193,4 @@ class FlipperService:
             disable_web_page_preview=False,
             reply_markup=keyboard,
         )
+        logger.info("Wysłano przez send_message: %s", offer.url)
