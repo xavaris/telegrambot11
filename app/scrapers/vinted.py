@@ -5,7 +5,7 @@ import logging
 from playwright.async_api import Browser
 
 from app.models import Offer
-from app.scrapers.base import BaseScraper
+from app.scrapers.base import BaseScraper, OfferCallback
 from app.utils.iphone_parser import parse_iphone_attributes
 from app.utils.misc import absolute_url, clean_text, normalize_price
 
@@ -19,16 +19,17 @@ class VintedScraper(BaseScraper):
         super().__init__(settings)
         self.start_url = settings.VINTED_SEARCH_URL
 
-    async def scrape(self, browser: Browser) -> list[Offer]:
+    async def scrape(
+        self,
+        browser: Browser,
+        on_offer: OfferCallback | None = None,
+    ) -> list[Offer]:
         page = await self._new_page(browser)
         offers: list[Offer] = []
 
         try:
             await self.goto(page, self.start_url)
-            await page.wait_for_timeout(4000)
-
-            logger.info("[vinted] URL otwarty: %s", self.start_url)
-            logger.info("[vinted] Tytuł strony: %s", await page.title())
+            await page.wait_for_timeout(3500)
 
             cards = page.locator("a[href*='/items/']")
             count = await cards.count()
@@ -46,12 +47,14 @@ class VintedScraper(BaseScraper):
 
             logger.info("[vinted] Unikalnych URL-i do sprawdzenia: %s", len(urls))
 
-            for idx, url in enumerate(urls[: self.settings.MAX_OFFERS_PER_SOURCE]):
+            # Idziemy po kolei od góry listy.
+            # Jeśli URL wyszukiwania masz ustawiony na "najnowsze", to to będą najnowsze oferty.
+            for idx, url in enumerate(urls):
                 detail_page = await self._new_page(browser)
 
                 try:
                     await self.goto(detail_page, url)
-                    await detail_page.wait_for_timeout(2500)
+                    await detail_page.wait_for_timeout(1800)
 
                     title = ""
                     for selector in [
@@ -88,8 +91,7 @@ class VintedScraper(BaseScraper):
                     imgs = detail_page.locator("img")
                     img_count = await imgs.count()
                     for j in range(min(img_count, 8)):
-                        src = await imgs.nth(j).get_attribute("src")
-                        src = (src or "").strip()
+                        src = (await imgs.nth(j).get_attribute("src") or "").strip()
                         if src.startswith("http://") or src.startswith("https://"):
                             image_url = src
                             break
@@ -115,40 +117,44 @@ class VintedScraper(BaseScraper):
                         "poznań",
                         "gdańsk",
                         "łódź",
+                        "szczecin",
+                        "bydgoszcz",
+                        "lublin",
+                        "katowice",
                     ]:
                         if possible in full_text.lower():
                             location = possible.title()
                             break
 
                     model, storage, color, condition = parse_iphone_attributes(
-                        title, description or full_text
+                        title,
+                        description or full_text,
+                    )
+
+                    offer = Offer(
+                        source=self.source_name,
+                        title=title or "Oferta z Vinted",
+                        url=url,
+                        price=price,
+                        location=location,
+                        image_url=image_url,
+                        description=description,
+                        condition=condition,
+                        model=model,
+                        storage=storage,
+                        color=color,
+                        raw_payload={"full_text": full_text[:2000]},
                     )
 
                     logger.info(
-                        "[vinted] DETAIL #%s | model=%s | price=%s | title=%s | url=%s",
+                        "[vinted] DETAIL #%s | model=%s | price=%s | title=%s",
                         idx,
                         model,
                         price,
                         title,
-                        url,
                     )
 
-                    offers.append(
-                        Offer(
-                            source=self.source_name,
-                            title=title or "Oferta z Vinted",
-                            url=url,
-                            price=price,
-                            location=location,
-                            image_url=image_url,
-                            description=description,
-                            condition=condition,
-                            model=model,
-                            storage=storage,
-                            color=color,
-                            raw_payload={"full_text": full_text[:2000]},
-                        )
-                    )
+                    await self.emit_offer(offer, offers, on_offer=on_offer)
 
                 except Exception:
                     logger.exception("[vinted] Błąd podczas parsowania detail page: %s", url)
