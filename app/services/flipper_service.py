@@ -98,7 +98,7 @@ class FlipperService:
         )
         return len(offers)
 
-    async def process_offer(self, offer: Offer) -> None:
+    async def process_offer(self, offer) -> None:
         if not offer.url:
             return
 
@@ -164,7 +164,7 @@ class FlipperService:
         retry=retry_if_exception_type(Exception),
         reraise=True,
     )
-    async def publish_offer(self, offer: Offer) -> None:
+    async def publish_offer(self, offer) -> None:
         caption = build_offer_caption(offer, self.settings)
         keyboard = build_offer_keyboard(offer)
 
@@ -177,7 +177,9 @@ class FlipperService:
 
         image_url = (offer.image_url or "").strip()
 
-        if image_url.startswith("http://") or image_url.startswith("https://"):
+        has_valid_image = image_url.startswith("http://") or image_url.startswith("https://")
+
+        if has_valid_image:
             try:
                 await self.bot.send_photo(
                     chat_id=self.settings.CHANNEL_ID,
