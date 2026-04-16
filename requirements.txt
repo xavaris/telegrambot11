@@ -1,0 +1,9 @@
+aiogram==3.20.0.post0
+APScheduler==3.10.4
+playwright==1.53.0
+aiosqlite==0.20.0
+pydantic==2.11.4
+pydantic-settings==2.8.1
+python-dotenv==1.0.1
+tenacity==9.0.0
+orjson==3.10.16
