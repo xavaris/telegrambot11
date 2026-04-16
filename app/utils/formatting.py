@@ -25,14 +25,21 @@ def build_offer_caption(offer: Offer, settings: Settings) -> str:
         f"<b>Stan:</b> {html.escape(offer.condition or 'Brak danych')}",
         f"<b>Score okazji:</b> {offer.score:.1%}",
         "",
-        f"<b>Tytuł:</b> {html.escape(offer.title)}",
+        f"<b>Tytuł:</b> {html.escape(offer.title or 'Brak danych')}",
     ]
 
-    if offer.description:
-        description = html.escape(offer.description[:350])
-        parts.extend(["", f"<b>Opis:</b> {description}"])
+    clean_description = (offer.description or "").strip()
+    if clean_description:
+        parts.extend([
+            "",
+            f"<b>Opis:</b> {html.escape(clean_description[:350])}",
+        ])
 
-    parts.extend(["", f"<b>Link:</b> {html.escape(offer.url)}"])
+    parts.extend([
+        "",
+        f"<b>Link:</b> {html.escape(offer.url)}",
+    ])
+
     return "\n".join(parts)
 
 
