@@ -25,7 +25,9 @@ class FlipperService:
         self.bot = bot
         self.db = db
         self.settings = settings
-        self._lock = asyncio.Lock()
+        self._scan_lock = asyncio.Lock()
+        self._process_lock = asyncio.Lock()
+        self._processing_keys: set[str] = set()
 
     def _get_scrapers(self):
         scrapers = []
@@ -38,113 +40,123 @@ class FlipperService:
         return scrapers
 
     async def run_scan(self) -> None:
-        if self._lock.locked():
+        if self._scan_lock.locked():
             logger.warning("Poprzedni scan jeszcze trwa — pomijam kolejne wywołanie.")
             return
 
-        async with self._lock:
+        async with self._scan_lock:
             logger.info("=== START SCAN ===")
+            self._processing_keys.clear()
 
-            offers = await self._collect_offers()
-            logger.info("Zebrano ofert: %s", len(offers))
+            scrapers = self._get_scrapers()
+            if not scrapers:
+                logger.warning("Brak aktywnych scraperów.")
+                return
 
-            for offer in offers[:20]:
-                logger.info(
-                    "RAW | source=%s | model=%s | price=%s | title=%s | image_url=%s",
-                    offer.source,
-                    offer.model,
-                    offer.price,
-                    offer.title,
-                    offer.image_url,
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=self.settings.HEADLESS,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
                 )
-
-            filtered = self._filter_and_score(offers)
-            logger.info("Po filtrach zostało: %s", len(filtered))
-
-            for offer in filtered[:20]:
-                logger.info(
-                    "FILTERED | source=%s | model=%s | price=%s | score=%s | title=%s",
-                    offer.source,
-                    offer.model,
-                    offer.price,
-                    offer.score,
-                    offer.title,
-                )
-
-            published = 0
-            for offer in filtered:
-                if await self.db.has_seen(offer):
-                    logger.info("Pomijam seen offer: %s", offer.url)
-                    continue
 
                 try:
-                    await self.publish_offer(offer)
-                    await self.db.mark_seen(offer)
-                    published += 1
-                except Exception:
-                    logger.exception("Nie udało się opublikować oferty: %s", offer.url)
+                    tasks = [
+                        asyncio.create_task(self._run_single_scraper(scraper, browser))
+                        for scraper in scrapers
+                    ]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            logger.info("=== KONIEC SCAN | opublikowano=%s ===", published)
+                    for scraper, result in zip(scrapers, results):
+                        if isinstance(result, Exception):
+                            logger.exception(
+                                "Scraper %s zakończył się błędem",
+                                scraper.source_name,
+                                exc_info=result,
+                            )
+                        else:
+                            logger.info(
+                                "Scraper %s zakończył pracę | zebrano=%s",
+                                scraper.source_name,
+                                result,
+                            )
+                finally:
+                    await browser.close()
 
-    async def _collect_offers(self) -> list[Offer]:
-        scrapers = self._get_scrapers()
-        if not scrapers:
-            logger.warning("Brak aktywnych scraperów.")
-            return []
+            logger.info("=== KONIEC SCAN ===")
 
-        all_offers: list[Offer] = []
+    async def _run_single_scraper(self, scraper, browser) -> int:
+        logger.info("Start scrapera: %s", scraper.source_name)
+        offers = await scraper.scrape(browser, on_offer=self.process_offer)
+        logger.info(
+            "Koniec scrapera: %s | ofert łącznie=%s",
+            scraper.source_name,
+            len(offers),
+        )
+        return len(offers)
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=self.settings.HEADLESS,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
+    async def process_offer(self, offer: Offer) -> None:
+        if not offer.url:
+            return
+
+        async with self._process_lock:
+            if offer.unique_key in self._processing_keys:
+                logger.info("Pomijam duplikat w bieżącym skanie: %s", offer.url)
+                return
+            self._processing_keys.add(offer.unique_key)
+
+        try:
+            logger.info(
+                "RAW | source=%s | model=%s | price=%s | title=%s | url=%s",
+                offer.source,
+                offer.model,
+                offer.price,
+                offer.title,
+                offer.url,
             )
 
-            try:
-                tasks = [scraper.scrape(browser) for scraper in scrapers]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for result in results:
-                    if isinstance(result, Exception):
-                        logger.exception("Scraper zwrócił wyjątek", exc_info=result)
-                        continue
-                    all_offers.extend(result)
-
-            finally:
-                await browser.close()
-
-        # deduplikacja po URL
-        unique_by_url: dict[str, Offer] = {}
-        for offer in all_offers:
-            if offer.url and offer.url not in unique_by_url:
-                unique_by_url[offer.url] = offer
-
-        return list(unique_by_url.values())
-
-    def _filter_and_score(self, offers: list[Offer]) -> list[Offer]:
-        final: list[Offer] = []
-
-        for offer in offers:
             if not offer_passes_basic_filters(offer, self.settings):
-                continue
+                logger.info("FILTER OUT | source=%s | title=%s", offer.source, offer.title)
+                return
 
             offer.score = calculate_offer_score(offer, self.settings.reference_prices)
 
-            # mały bonus za preferowaną lokalizację
             if is_location_preferred(offer.location, self.settings):
                 offer.score += 0.02
 
             if offer.score < self.settings.MIN_DEAL_SCORE:
-                continue
+                logger.info(
+                    "SCORE OUT | source=%s | score=%s | title=%s",
+                    offer.source,
+                    offer.score,
+                    offer.title,
+                )
+                return
 
-            final.append(offer)
+            if await self.db.has_seen(offer):
+                logger.info("Pomijam seen offer: %s", offer.url)
+                return
 
-        final.sort(key=lambda x: (x.score, -x.price), reverse=True)
-        return final
+            logger.info(
+                "FILTERED | source=%s | model=%s | price=%s | score=%s | title=%s",
+                offer.source,
+                offer.model,
+                offer.price,
+                offer.score,
+                offer.title,
+            )
+
+            await self.publish_offer(offer)
+            await self.db.mark_seen(offer)
+
+        except Exception:
+            logger.exception("Błąd przy procesowaniu oferty: %s", offer.url)
+        finally:
+            async with self._process_lock:
+                self._processing_keys.discard(offer.unique_key)
 
     @retry(
         stop=stop_after_attempt(3),
@@ -165,7 +177,6 @@ class FlipperService:
 
         image_url = (offer.image_url or "").strip()
 
-        # zdjęcie wysyłamy tylko wtedy, gdy wygląda jak poprawny pełny URL
         if image_url.startswith("http://") or image_url.startswith("https://"):
             try:
                 await self.bot.send_photo(
@@ -185,7 +196,6 @@ class FlipperService:
                     e,
                 )
 
-        # fallback bez zdjęcia
         await self.bot.send_message(
             chat_id=self.settings.CHANNEL_ID,
             text=caption,
