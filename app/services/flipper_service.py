@@ -198,17 +198,24 @@ class FlipperService:
             offer.price,
         )
 
+        send_kwargs = {
+            "chat_id": self.settings.CHANNEL_ID,
+            "reply_markup": keyboard,
+        }
+
+        if self.settings.MESSAGE_THREAD_ID:
+            send_kwargs["message_thread_id"] = self.settings.MESSAGE_THREAD_ID
+
         image_url = (offer.image_url or "").strip()
         has_valid_image = image_url.startswith("http://") or image_url.startswith("https://")
 
         if has_valid_image:
             try:
                 await self.bot.send_photo(
-                    chat_id=self.settings.CHANNEL_ID,
                     photo=image_url,
                     caption=caption,
                     parse_mode="HTML",
-                    reply_markup=keyboard,
+                    **send_kwargs,
                 )
                 logger.info("Wysłano przez send_photo: %s", offer.url)
                 return
@@ -221,10 +228,9 @@ class FlipperService:
                 )
 
         await self.bot.send_message(
-            chat_id=self.settings.CHANNEL_ID,
             text=caption,
             parse_mode="HTML",
             disable_web_page_preview=False,
-            reply_markup=keyboard,
+            **send_kwargs,
         )
         logger.info("Wysłano przez send_message: %s", offer.url)
