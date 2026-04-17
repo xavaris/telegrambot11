@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     TELEGRAM_TOKEN: str
     CHANNEL_ID: str
+    MESSAGE_THREAD_ID: int | None = None
 
     SCAN_INTERVAL_MINUTES: int = 15
     STARTUP_SCAN: bool = True
