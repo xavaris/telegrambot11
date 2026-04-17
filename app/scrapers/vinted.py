@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from playwright.async_api import Browser
 
@@ -60,6 +61,9 @@ class VintedScraper(BaseScraper):
                     await self.goto(detail_page, url)
                     await detail_page.wait_for_timeout(1800)
 
+                    # spróbuj rozwinąć opis
+                    await self._expand_description(detail_page)
+
                     title = await self._extract_title(detail_page)
                     full_text = clean_text(await detail_page.locator("body").inner_text())
                     price = await self._extract_price(detail_page)
@@ -116,12 +120,13 @@ class VintedScraper(BaseScraper):
                     )
 
                     logger.info(
-                        "[vinted] DETAIL #%s | model=%s | storage=%s | price=%s | title=%s",
+                        "[vinted] DETAIL #%s | model=%s | storage=%s | price=%s | title=%s | desc=%s",
                         idx,
                         model,
                         storage,
                         price,
                         title,
+                        bool(final_description),
                     )
 
                     await self.emit_offer(offer, offers, on_offer=on_offer)
@@ -137,11 +142,34 @@ class VintedScraper(BaseScraper):
         finally:
             await self.close_page(page)
 
+    async def _expand_description(self, page) -> None:
+        possible_texts = [
+            "więcej",
+            "… więcej",
+            "... więcej",
+            "more",
+            "show more",
+        ]
+
+        try:
+            for text in possible_texts:
+                locator = page.get_by_text(text, exact=False)
+                count = await locator.count()
+                if count:
+                    for i in range(min(count, 3)):
+                        try:
+                            await locator.nth(i).click(timeout=1000)
+                            await page.wait_for_timeout(500)
+                            return
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
     async def _extract_title(self, page) -> str:
         selectors = [
             "h1",
             "[data-testid='item-page-title']",
-            "div[class*='title']",
             "meta[property='og:title']",
         ]
 
@@ -150,8 +178,7 @@ class VintedScraper(BaseScraper):
                 if selector.startswith("meta"):
                     loc = page.locator(selector).first
                     if await loc.count():
-                        value = (await loc.get_attribute("content") or "").strip()
-                        value = clean_text(value)
+                        value = clean_text(await loc.get_attribute("content"))
                         if value:
                             return value
                 else:
@@ -168,19 +195,20 @@ class VintedScraper(BaseScraper):
     async def _extract_price(self, page) -> float:
         selectors = [
             "[data-testid='item-price']",
-            "div[class*='price']",
-            "span[class*='price']",
             "meta[property='product:price:amount']",
+            "span:has-text('zł')",
+            "div:has-text('zł')",
         ]
 
         for selector in selectors:
             try:
-                loc = page.locator(selector).first
-                if await loc.count():
+                loc = page.locator(selector)
+                count = await loc.count()
+                for i in range(min(count, 5)):
                     if selector.startswith("meta"):
-                        value = clean_text(await loc.get_attribute("content"))
+                        value = clean_text(await loc.nth(i).get_attribute("content"))
                     else:
-                        value = clean_text(await loc.inner_text())
+                        value = clean_text(await loc.nth(i).inner_text())
 
                     price = normalize_price(value)
                     if 50 <= price <= 20000:
@@ -220,47 +248,110 @@ class VintedScraper(BaseScraper):
         return ""
 
     async def _extract_description(self, page) -> str:
+        candidates: list[str] = []
+
         selectors = [
             "[data-testid='item-description']",
+            "div[data-testid='item-description']",
+            "section[data-testid='item-description']",
+            "div[class*='details'] p",
+            "div[class*='description'] p",
             "div[class*='description']",
-            "section p",
-            "section",
-        ]
-
-        bad_snippets = [
-            "strona główna",
-            "przedmioty użytkownika",
-            "podobne rzeczy",
-            "elektronika",
-            "telefony komórkowe",
-            "telefony komorkowe",
+            "aside p",
         ]
 
         for selector in selectors:
             try:
-                loc = page.locator(selector).first
-                if not await loc.count():
-                    continue
+                loc = page.locator(selector)
+                count = await loc.count()
 
-                value = clean_text(await loc.inner_text())
-                if not value:
-                    continue
-
-                lower_value = value.lower()
-                if any(snippet in lower_value for snippet in bad_snippets):
-                    continue
-
-                if len(value) > 500:
-                    value = value[:500].strip()
-
-                if len(value) < 10:
-                    continue
-
-                return value
+                for i in range(min(count, 8)):
+                    raw = clean_text(await loc.nth(i).inner_text())
+                    value = self._sanitize_description(raw)
+                    if value:
+                        candidates.append(value)
             except Exception:
                 continue
 
+        # dodatkowy fallback: szukamy dłuższych bloków po prawej kolumnie
+        try:
+            right_blocks = page.locator("aside div, section div")
+            count = await right_blocks.count()
+            for i in range(min(count, 20)):
+                raw = clean_text(await right_blocks.nth(i).inner_text())
+                value = self._sanitize_description(raw)
+                if value:
+                    candidates.append(value)
+        except Exception:
+            pass
+
+        if candidates:
+            candidates = sorted(set(candidates), key=len, reverse=True)
+            logger.info("[vinted] Wybrany opis: %s", candidates[0][:150])
+            return candidates[0]
+
         return ""
+
+    def _sanitize_description(self, text: str) -> str:
+        text = clean_text(text)
+        if not text:
+            return ""
+
+        lowered = text.lower()
+
+        banned_phrases = [
+            "rozwiń swój instagram",
+            "rozwin swoj instagram",
+            "super fani",
+            "podobne rzeczy",
+            "strona główna",
+            "przedmioty użytkownika",
+            "elektronika",
+            "telefony komórkowe",
+            "telefony komorkowe",
+            "obserwuj",
+            "kup teraz",
+            "promuj",
+            "katalog",
+            "vinted",
+            "przedmioty użytkownika",
+            "sprawdź także",
+            "sprawdz takze",
+            "ochrona kupujących",
+            "weryfikacja elektroniki",
+            "zapytaj",
+            "zaproponuj cenę",
+            "zaproponuj cene",
+            "wysyłka",
+            "wysylka",
+        ]
+
+        if any(phrase in lowered for phrase in banned_phrases):
+            return ""
+
+        if len(text) < 20:
+            return ""
+
+        # opis nie powinien być samą listą parametrów
+        param_keys = [
+            "marka", "model", "pamięć", "pamiec", "stan", "kolor",
+            "blokada sim-lock", "kondycja baterii", "dodane"
+        ]
+        if sum(1 for key in param_keys if key in lowered) >= 3:
+            return ""
+
+        # za dużo cyfr / za mało liter
+        letters = sum(ch.isalpha() for ch in text)
+        if letters < 15:
+            return ""
+
+        if re.search(r"\b(follow|instagram|fans|promo|shop now)\b", lowered):
+            return ""
+
+        if len(text) > 500:
+            text = text[:500].strip()
+
+        return text
 
     async def _extract_details_map(self, page) -> dict[str, str]:
         details: dict[str, str] = {}
@@ -292,8 +383,18 @@ class VintedScraper(BaseScraper):
     def _extract_location_from_text(self, full_text: str) -> str:
         lowered = full_text.lower()
         cities = [
-            "warszawa", "kraków", "wrocław", "poznań", "gdańsk", "łódź",
-            "szczecin", "bydgoszcz", "lublin", "katowice", "gdynia", "sopot"
+            "warszawa",
+            "kraków",
+            "wrocław",
+            "poznań",
+            "gdańsk",
+            "łódź",
+            "szczecin",
+            "bydgoszcz",
+            "lublin",
+            "katowice",
+            "gdynia",
+            "sopot",
         ]
 
         for city in cities:
