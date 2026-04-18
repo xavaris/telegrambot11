@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -37,12 +36,18 @@ class Settings(BaseSettings):
     )
 
     ONLY_MODELS: str = ""
+
     EXCLUDED_KEYWORDS: str = (
         "icloud,blokada,na części,na czesci,uszkodzony,zbity,bez face id,"
-        "etui,case,pokrowiec,szkło,szklo,ładowarka,ladowarka,kabel,"
-        "pudełko,pudelko,karton,box,obudowa,plecki,wyświetlacz,wyswietlacz,"
-        "bateria,taśma,tasma"
+        "na raty,etui,case,pokrowiec,szkło,szklo,ładowarka,ladowarka,kabel,"
+        "pudełko,pudelko,karton,box,obudowa,plecki,maska,cover,filtr,"
+        "obiektyw,lens,moment,quick lock,quick-lock,variable nd,nd,"
+        "adapter,uchwyt,mag safe,magsafe,powerbank,ring,strap,"
+        "futerał,futeral,bumper,silikon,silicone,folia,ochronne,"
+        "wyświetlacz,wyswietlacz,ekran,lcd,oled,bateria,taśma,tasma,"
+        "trup,dawca,płyta,plyta,klapka,ramka,gniazdo,do iphone,za iphone"
     )
+
     PREFERRED_LOCATIONS: str = ""
     PREFERRED_REGIONS: str = ""
 
