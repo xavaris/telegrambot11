@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +5,7 @@ import logging
 
 from aiogram import Bot
 from playwright.async_api import async_playwright
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.config import Settings
 from app.db import Database
@@ -27,18 +26,23 @@ class FlipperService:
         self.db = db
         self.settings = settings
         self.translator = TranslatorService(target_lang=settings.TRANSLATE_TO_LANGUAGE)
+
         self._scan_lock = asyncio.Lock()
         self._process_lock = asyncio.Lock()
         self._processing_keys: set[str] = set()
 
-    def _get_scrapers(self):
+    def _get_scrapers(self) -> list:
         scrapers = []
+
         if self.settings.ENABLE_VINTED:
             scrapers.append(VintedScraper(self.settings))
+
         if self.settings.ENABLE_OLX:
             scrapers.append(OLXScraper(self.settings))
+
         if self.settings.ENABLE_ALLEGRO_LOKALNIE:
             scrapers.append(AllegroLokalnieScraper(self.settings))
+
         return scrapers
 
     async def run_scan(self) -> None:
@@ -49,6 +53,7 @@ class FlipperService:
         async with self._scan_lock:
             logger.info("=== START SCAN ===")
             self._processing_keys.clear()
+
             scrapers = self._get_scrapers()
             if not scrapers:
                 logger.warning("Brak aktywnych scraperów.")
@@ -57,24 +62,46 @@ class FlipperService:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=self.settings.HEADLESS,
-                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
                 )
+
                 try:
-                    tasks = [asyncio.create_task(self._run_single_scraper(scraper, browser)) for scraper in scrapers]
+                    tasks = [
+                        asyncio.create_task(self._run_single_scraper(scraper, browser))
+                        for scraper in scrapers
+                    ]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
+
                     for scraper, result in zip(scrapers, results):
                         if isinstance(result, Exception):
-                            logger.exception("Scraper %s zakończył się błędem", scraper.source_name, exc_info=result)
+                            logger.exception(
+                                "Scraper %s zakończył się błędem",
+                                scraper.source_name,
+                                exc_info=result,
+                            )
                         else:
-                            logger.info("Scraper %s zakończył pracę | zebrano=%s", scraper.source_name, result)
+                            logger.info(
+                                "Scraper %s zakończył pracę | zebrano=%s",
+                                scraper.source_name,
+                                result,
+                            )
                 finally:
                     await browser.close()
+
             logger.info("=== KONIEC SCAN ===")
 
     async def _run_single_scraper(self, scraper, browser) -> int:
         logger.info("Start scrapera: %s", scraper.source_name)
         offers = await scraper.scrape(browser, on_offer=self.process_offer)
-        logger.info("Koniec scrapera: %s | ofert łącznie=%s", scraper.source_name, len(offers))
+        logger.info(
+            "Koniec scrapera: %s | ofert łącznie=%s",
+            scraper.source_name,
+            len(offers),
+        )
         return len(offers)
 
     async def process_offer(self, offer: Offer) -> None:
@@ -88,24 +115,41 @@ class FlipperService:
             self._processing_keys.add(offer.unique_key)
 
         try:
-            logger.info("RAW | source=%s | model=%s | storage=%s | price=%s | title=%s | url=%s",
-                        offer.source, offer.model, offer.storage, offer.price, offer.title, offer.url)
+            logger.info(
+                "RAW | source=%s | model=%s | storage=%s | price=%s | title=%s | url=%s",
+                offer.source,
+                offer.model,
+                offer.storage,
+                offer.price,
+                offer.title,
+                offer.url,
+            )
 
+            # Najpierw twarde filtry — zanim oferta dotknie baseline/score.
             if not offer_passes_basic_filters(offer, self.settings):
                 logger.info("FILTER OUT | source=%s | title=%s", offer.source, offer.title)
                 return
 
-            if self.settings.ENABLE_TRANSLATION:
-                offer.description = self.translator.normalize_description_for_post(offer.description)
+            if self.settings.ENABLE_TRANSLATION and offer.description:
+                offer.description = self.translator.normalize_description_for_post(
+                    offer.description
+                )
 
-            baseline_data = await self.db.get_market_baseline(model=offer.model, storage=offer.storage)
+            baseline_data = await self.db.get_market_baseline(
+                model=offer.model,
+                storage=offer.storage,
+            )
+
             if baseline_data:
                 baseline_price, sample_size, scope = baseline_data
                 offer.market_baseline = baseline_price
                 offer.market_sample_size = sample_size
                 offer.market_scope = scope
-                if baseline_price > 0:
+
+                if baseline_price > 0 and offer.price > 0:
                     offer.score = round((baseline_price - offer.price) / baseline_price, 4)
+                else:
+                    offer.score = 0.0
             else:
                 offer.score = 0.0
 
@@ -113,13 +157,29 @@ class FlipperService:
                 offer.score += 0.02
 
             if offer.score < self.settings.MIN_DEAL_SCORE:
-                logger.info("SCORE OUT | source=%s | score=%s | baseline=%s | title=%s",
-                            offer.source, offer.score, offer.market_baseline, offer.title)
+                logger.info(
+                    "SCORE OUT | source=%s | score=%s | baseline=%s | title=%s",
+                    offer.source,
+                    offer.score,
+                    offer.market_baseline,
+                    offer.title,
+                )
                 return
 
             if await self.db.has_seen(offer):
                 logger.info("Pomijam seen offer: %s", offer.url)
                 return
+
+            logger.info(
+                "FILTERED | source=%s | model=%s | storage=%s | price=%s | score=%s | baseline=%s | title=%s",
+                offer.source,
+                offer.model,
+                offer.storage,
+                offer.price,
+                offer.score,
+                offer.market_baseline,
+                offer.title,
+            )
 
             await self.publish_offer(offer)
             await self.db.mark_seen(offer)
@@ -139,23 +199,47 @@ class FlipperService:
     async def publish_offer(self, offer: Offer) -> None:
         caption = build_offer_caption(offer, self.settings)
         keyboard = build_offer_keyboard(offer)
+
+        logger.info(
+            "Publikuję ofertę: %s | %s | %s | %.2f",
+            offer.source,
+            offer.model,
+            offer.storage,
+            offer.price,
+        )
+
         send_kwargs = {
             "chat_id": self.settings.CHANNEL_ID,
             "parse_mode": "HTML",
             "reply_markup": keyboard,
         }
-        if self.settings.MESSAGE_THREAD_ID:
+
+        if self.settings.MESSAGE_THREAD_ID is not None:
             send_kwargs["message_thread_id"] = self.settings.MESSAGE_THREAD_ID
 
         image_url = (offer.image_url or "").strip()
-        has_valid_image = image_url.startswith(("http://", "https://"))
+        has_valid_image = image_url.startswith("http://") or image_url.startswith("https://")
+
         if has_valid_image:
             try:
-                await self.bot.send_photo(photo=image_url, caption=caption, **send_kwargs)
+                await self.bot.send_photo(
+                    photo=image_url,
+                    caption=caption,
+                    **send_kwargs,
+                )
                 logger.info("Wysłano przez send_photo: %s", offer.url)
                 return
-            except Exception:
-                logger.exception("Błąd send_photo dla %s | image_url=%s", offer.url, image_url)
+            except Exception as e:
+                logger.exception(
+                    "Błąd send_photo dla %s | image_url=%s | error=%s",
+                    offer.url,
+                    image_url,
+                    e,
+                )
 
-        await self.bot.send_message(text=caption, disable_web_page_preview=False, **send_kwargs)
+        await self.bot.send_message(
+            text=caption,
+            disable_web_page_preview=False,
+            **send_kwargs,
+        )
         logger.info("Wysłano przez send_message: %s", offer.url)
