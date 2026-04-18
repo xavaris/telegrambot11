@@ -29,6 +29,10 @@ async def main() -> None:
     await db.init()
 
     bot = Bot(token=settings.TELEGRAM_TOKEN)
+
+    # Ważne: czyścimy webhook, żeby polling nie miał konfliktu
+    await bot.delete_webhook(drop_pending_updates=False)
+
     dp = Dispatcher()
 
     flipper = FlipperService(bot=bot, db=db, settings=settings)
